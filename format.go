@@ -68,6 +68,10 @@ func formatNotification(payload map[string]any) map[string]any {
 			label, value = strings.TrimSuffix(m[1], ":"), m[2]
 		} else if strings.HasPrefix(trimmed, "Application URL: ") {
 			label, value = "Application URL", strings.TrimPrefix(trimmed, "Application URL: ")
+		} else if strings.HasPrefix(trimmed, "Preview URL: ") {
+			label, value = "Application URL", strings.TrimPrefix(trimmed, "Preview URL: ")
+		} else if link := strings.Trim(trimmed, "*"); strings.HasPrefix(link, "<") && strings.HasSuffix(link, "|Deployment Logs>") {
+			label, value = "Deployment Logs", link
 		}
 		switch label {
 		case "Project", "Environment":
@@ -95,6 +99,8 @@ func formatNotification(payload map[string]any) map[string]any {
 	heading := title
 	lower := strings.ToLower(title)
 	switch {
+	case strings.HasPrefix(lower, "pull request"):
+		heading = "✅ " + title
 	case strings.Contains(lower, "successfully deployed"):
 		heading = "✅ Deployed"
 	case strings.Contains(lower, "deploy") && strings.Contains(lower, "fail"):

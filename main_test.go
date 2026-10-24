@@ -21,8 +21,13 @@ func decode(t *testing.T, body string) map[string]any {
 
 func TestCoolifyFormats(t *testing.T) {
 	description := "New version successfully deployed for sponsy-web\nApplication URL: https://getsponsy.com\n\n**Project:** Sponsy Metal\n**Environment:** production\n**Deployment Logs:** [View logs](https://coolify.getsponsy.com/deployment/123)"
-	for _, shape := range []string{"mattermost", "slack"} {
+	for _, shape := range []string{"mattermost", "slack", "coolify4.5"} {
 		t.Run(shape, func(t *testing.T) {
+			description := description
+			if shape == "coolify4.5" {
+				description = strings.ReplaceAll(description, "**", "*")
+				description = strings.ReplaceAll(description, "*Deployment Logs:* [View logs](https://coolify.getsponsy.com/deployment/123)", "*<https://coolify.getsponsy.com/deployment/123|Deployment Logs>*")
+			}
 			a := map[string]any{"color": "#00ff00", "title": "New version successfully deployed", "text": description}
 			if shape == "slack" {
 				a = map[string]any{"color": "#00ff00", "blocks": []any{
