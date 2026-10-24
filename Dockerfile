@@ -1,27 +1,16 @@
-# syntax=docker/dockerfile:1
-
-FROM golang:1.23.5
-
-# Set destination for COPY
-WORKDIR /app
-
-# Download Go modules
+FROM golang:1.25-alpine AS build
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+COPY *.go config.yml ./
+RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /conductor .
 
-# Copy the source code. Note the slash at the end, as explained in
-# https://docs.docker.com/reference/dockerfile/#copy
-COPY . .
-
-# Build
-RUN CGO_ENABLED=0 GOOS=linux go build -o conductor
-
-# Optional:
-# To bind to a TCP port, runtime parameters must be supplied to the docker command.
-# But we can document in the Dockerfile what ports
-# the application is going to listen on by default.
-# https://docs.docker.com/reference/dockerfile/#expose
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates && adduser -D -u 10001 conductor
+WORKDIR /app
+COPY --from=build /conductor ./conductor
+COPY config.yml ./config.yml
+USER conductor
 EXPOSE 8080
-
-# Run
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
 CMD ["./conductor"]

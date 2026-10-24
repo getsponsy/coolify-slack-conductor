@@ -2,94 +2,126 @@ package main
 
 import (
 	"bytes"
-	"fmt"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
+	"time"
 )
 
-type DebugTransport struct{}
+type conductor struct {
+	key     string
+	main    Destination
+	mirrors []Destination
+	client  *http.Client
+}
 
-func (DebugTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	b, err := httputil.DumpRequestOut(r, false)
+func (c conductor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
+		w.Write([]byte("ok"))
+		return
+	}
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	want, got := sha256.Sum256([]byte(c.key)), sha256.Sum256([]byte(r.URL.Query().Get("key")))
+	if c.key == "" || subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
-		return nil, err
-	}
-	fmt.Println(string(b))
-	return http.DefaultTransport.RoundTrip(r)
-}
-
-func reverseproxy() *httputil.ReverseProxy {
-	rewrite := func(req *httputil.ProxyRequest) {
-		// Read body
-		body, _ := io.ReadAll(req.In.Body)
-		log.Println(string(body))
-
-		req.SetXForwarded() // set headers on Out request
-
-		dests := destinations(string(body))
-
-		// Reset body back to original
-		req.In.Body = io.NopCloser(bytes.NewBuffer(body))
-		req.Out.Body = io.NopCloser(bytes.NewBuffer(body))
-
-		// Send to relevant destinations
-		for _, dest := range dests {
-			log.Println("Mirroring to", dest.url)
-
-			// Cloned request for the mirror
-			mReq := req.Out.Clone(req.Out.Context())
-			mReq.Body = io.NopCloser(bytes.NewReader(body))
-
-			mirrorRequest(*mReq, dest.url)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "invalid body", http.StatusBadRequest)
 		}
-
-		// Always send to main destination
-		destUrl, _ := url.Parse(MainDestination.url)
-		log.Println("Sending to main:", destUrl.String())
-		setRequestPath(req.Out, destUrl)
+		return
 	}
-
-	proxy := &httputil.ReverseProxy{Rewrite: rewrite}
-	proxy.Transport = DebugTransport{}
-
-	return proxy
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil || payload == nil || len(payload) == 0 {
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	out, err := json.Marshal(formatNotification(payload))
+	if err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+	status, retryAfter, err := c.send(r, c.main, out)
+	if err != nil {
+		log.Print("main Slack delivery failed")
+		http.Error(w, "Slack delivery failed", http.StatusBadGateway)
+		return
+	}
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	if status < 200 || status >= 300 {
+		// Coolify disables notification settings after 403/404/410. Keep
+		// downstream failures retryable without disabling this endpoint.
+		if status != http.StatusTooManyRequests {
+			status = http.StatusBadGateway
+		}
+		log.Print("main Slack delivery rejected")
+		http.Error(w, "Slack delivery rejected", status)
+		return
+	}
+	seen := map[string]bool{c.main.url: true}
+	for _, dest := range c.mirrors {
+		if !seen[dest.url] && dest.Matches(string(body)) {
+			seen[dest.url] = true
+			code, _, err := c.send(r, dest, out)
+			if err != nil || code < 200 || code >= 300 {
+				log.Print("mirror Slack delivery failed")
+			}
+		}
+	}
+	log.Print("Slack notification delivered")
+	w.Write([]byte("ok"))
 }
 
-var authKey = os.Getenv("AUTH_KEY")
+func (c conductor) send(in *http.Request, dest Destination, body []byte) (int, string, error) {
+	req, err := http.NewRequestWithContext(in.Context(), http.MethodPost, dest.url, bytes.NewReader(body))
+	if err != nil {
+		return 0, "", err
+	}
+	// Do not forward the conductor key, incoming headers, or query to Slack.
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, resp.Header.Get("Retry-After"), nil
+}
 
 func main() {
-	log.Println("Starting")
-
-	// Load configurations & validate
 	loadDestinations()
-	if authKey == "" {
-		log.Fatalln("Missing AUTH_KEY environment variable")
+	key := os.Getenv("AUTH_KEY")
+	if key == "" {
+		log.Fatal("Missing AUTH_KEY environment variable")
 	}
-
-	proxy := reverseproxy()
-
-	// Http server
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		// Redirect GET root to github repo
-		if req.Method == "GET" && req.RequestURI == "/" {
-			http.Redirect(w, req, "https://github.com/hackclub/coolify-slack-conductor", 302)
-			return
-		}
-
-		// Having authentication here prevents ppl from spamming our slack channels
-		if len(req.URL.Query()["key"]) == 0 || req.URL.Query()["key"][0] != authKey {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			log.Println("Invalid authentication:", req.RequestURI)
-			return
-		}
-
-		// Pass request to the reverse proxy
-		proxy.ServeHTTP(w, req)
-	})
-
-	log.Fatalln(http.ListenAndServe(":8080", nil))
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	server := &http.Server{
+		Addr: ":8080", Handler: conductor{key, MainDestination, LoadedDestinations, client},
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+		WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
+	}
+	log.Print("Conductor listening on :8080")
+	log.Fatal(server.ListenAndServe())
 }
