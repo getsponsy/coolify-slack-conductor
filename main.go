@@ -14,10 +14,11 @@ import (
 )
 
 type conductor struct {
-	key     string
-	main    Destination
-	mirrors []Destination
-	client  *http.Client
+	key      string
+	main     Destination
+	mirrors  []Destination
+	client   *http.Client
+	enricher *deploymentEnricher
 }
 
 func (c conductor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +55,9 @@ func (c conductor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
 		return
 	}
-	out, err := json.Marshal(formatNotification(payload))
+	formatted := formatNotification(payload)
+	c.enricher.enrich(r.Context(), formatted)
+	out, err := json.Marshal(formatted)
 	if err != nil {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
@@ -117,8 +120,12 @@ func main() {
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
+	enricher, err := newDeploymentEnricher(os.Getenv("COOLIFY_INSTANCE_URL"), os.Getenv("COOLIFY_API_URL"), os.Getenv("COOLIFY_API_TOKEN"), client)
+	if err != nil {
+		log.Fatal(err)
+	}
 	server := &http.Server{
-		Addr: ":8080", Handler: conductor{key, MainDestination, LoadedDestinations, client},
+		Addr: ":8080", Handler: conductor{key: key, main: MainDestination, mirrors: LoadedDestinations, client: client, enricher: enricher},
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
 	}

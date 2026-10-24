@@ -8,7 +8,7 @@ import (
 
 var metadataLine = regexp.MustCompile(`^\*{1,2}([^*:]+):?\*{1,2}:?\s*(.*)$`)
 var markdownLink = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s)]+)\)`)
-var deploymentApp = regexp.MustCompile(`(?i)^(?:new version successfully deployed|deployment failed|deployment started|deploying) for (.+)$`)
+var deploymentApp = regexp.MustCompile(`(?i)^(?:new version successfully deployed|pull request deployment failed|deployment failed|deployment started|deploying) for (.+)$`)
 
 func object(v any) map[string]any { m, _ := v.(map[string]any); return m }
 func stringValue(v any) string    { s, _ := v.(string); return s }
@@ -99,6 +99,8 @@ func formatNotification(payload map[string]any) map[string]any {
 	heading := title
 	lower := strings.ToLower(title)
 	switch {
+	case strings.HasPrefix(lower, "pull request") && strings.Contains(lower, "failed"):
+		heading = "🚨 " + title
 	case strings.HasPrefix(lower, "pull request"):
 		heading = "✅ " + title
 	case strings.Contains(lower, "successfully deployed"):
